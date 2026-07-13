@@ -8,6 +8,7 @@ const {
   saveTodayWaterLiters,
   fetchTodayPlan,
   ensureTodayPlan,
+  listAiPlans,
   toggleActivityComplete,
   addScheduledActivity,
 } = require('../services/aiPlanService');
@@ -42,11 +43,24 @@ router.post('/save', async (req, res) => {
     if (!plan?.items?.length) {
       return res.status(400).json({ error: 'plan_required' });
     }
-    const result = await saveDailyPlan(req.userId, plan);
+    const forDate =
+      typeof req.body?.date === 'string' ? req.body.date : undefined;
+    const result = await saveDailyPlan(req.userId, plan, forDate);
     res.json(result);
   } catch (err) {
     console.error('[ai-plan/save]', err);
     res.status(500).json({ error: 'plan_save_failed', message: err.message });
+  }
+});
+
+router.get('/list', async (req, res) => {
+  try {
+    const limit = req.query.limit ? Number(req.query.limit) : 30;
+    const plans = await listAiPlans(req.userId, { limit });
+    res.json({ plans });
+  } catch (err) {
+    console.error('[ai-plan/list]', err);
+    res.status(500).json({ error: 'plan_list_failed', message: err.message });
   }
 });
 

@@ -224,7 +224,10 @@ nutrients alanları o öğünün günlük ihtiyacı karşılama yüzdesi olsun (
 }
 
 async function generateMealImage(title, mealType) {
-  if (!openaiApiKey) return null;
+  if (!openaiApiKey) {
+    console.warn('[nutrition/image] OPENAI_API_KEY yok');
+    return null;
+  }
   try {
     const response = await fetch('https://api.openai.com/v1/images/generations', {
       method: 'POST',
@@ -233,16 +236,19 @@ async function generateMealImage(title, mealType) {
         Authorization: `Bearer ${openaiApiKey}`,
       },
       body: JSON.stringify({
-        // Hesapta dall-e-2 yok; en ucuz GPT Image varyantı.
         model: 'gpt-image-1-mini',
-        prompt: `Appetizing realistic food photo of ${title} (${mealType}), top-down plate, natural light, no text, no watermark`,
+        prompt:
+          `Photorealistic food photo of exactly this dish: "${title}". ` +
+          `Meal type: ${mealType}. Show only this specific dish on a plate, ` +
+          `unique ingredients matching the title, natural daylight, appetizing, ` +
+          `no text, no watermark, no people, no other unrelated foods.`,
         size: '1024x1024',
         quality: 'low',
         n: 1,
       }),
     });
     if (!response.ok) {
-      console.warn('[nutrition/image]', response.status, await response.text());
+      console.warn('[nutrition/image]', title, response.status, await response.text());
       return null;
     }
     const data = await response.json();
@@ -258,7 +264,7 @@ async function generateMealImage(title, mealType) {
     }
     return null;
   } catch (err) {
-    console.warn('[nutrition/image]', err.message);
+    console.warn('[nutrition/image]', title, err.message);
     return null;
   }
 }
@@ -413,55 +419,96 @@ async function generateAndSavePlan(userId, questionnaire = {}, forDate = new Dat
     meal.id = mealId;
   }
 
-  // Görselleri arka planda üret — plan yanıtını bekletme.
-  void fillMealImagesInBackground(userId, planId, plan.meals).catch((err) => {
-    console.warn('[nutrition/images-bg]', err.message);
-  });
+  // Görseller hazır olmadan plan dönülmez.
+  await fillMealImages(userId, planId, plan.meals);
 
-  return formatPlanResponse({
-    id: planId,
-    plan_date: key,
-    daily_calories: plan.dailyCalories,
-    water_liters: plan.waterLiters,
-    protein_g: plan.dailyMacros.protein,
-    fat_g: plan.dailyMacros.fat,
-    carbs_g: plan.dailyMacros.carbs,
-  }, plan.meals.map((m, i) => ({
-    id: m.id,
-    title: m.title,
-    meal_type: m.mealType,
-    calories: m.calories,
-    protein_g: m.macros.protein,
-    fat_g: m.macros.fat,
-    carbs_g: m.macros.carbs,
-    image_url: m.imageUrl || null,
-    ingredients_json: JSON.stringify(m.ingredients || []),
-    instructions_json: JSON.stringify(m.instructions || []),
-    nutrients_json: JSON.stringify(m.nutrients || {}),
-    cooking_minutes: m.cookingMinutes,
-    sort_order: i,
-  })));
+  // Güncel image_url'leri DB'den al.
+  const mealRows = await query(
+    `SELECT * FROM user_nutrition_meals
+     WHERE plan_id = ?
+     ORDER BY sort_order ASC`,
+    [planId],
+  );
+
+  const missingImages = (mealRows || []).filter((m) => !m.image_url);
+  if (missingImages.length > 0) {
+    const titles = missingImages.map((m) => m.title).join(', ');
+    const err = new Error(`nutrition_images_incomplete: ${titles}`);
+    err.status = 503;
+    throw err;
+  }
+
+  return formatPlanResponse(
+    {
+      id: planId,
+      plan_date: key,
+      daily_calories: plan.dailyCalories,
+      water_liters: plan.waterLiters,
+      protein_g: plan.dailyMacros.protein,
+      fat_g: plan.dailyMacros.fat,
+      carbs_g: plan.dailyMacros.carbs,
+    },
+    mealRows,
+  );
 }
 
-/** Öğün görsellerini CDN'e yükleyip DB'yi günceller (yanıt sonrası). */
-async function fillMealImagesInBackground(userId, planId, meals) {
-  await Promise.all(
-    meals.map(async (meal, index) => {
-      if (!meal?.id) return;
-      const buffer = await generateMealImage(meal.title, meal.mealType);
-      if (!buffer) return;
+/** Öğün görsellerini CDN'e yükleyip DB'yi günceller — yanıt öncesi tamamlanır. */
+async function fillMealImages(userId, planId, meals) {
+  // Paralel rate-limit riski yüksek; sırayla üret.
+  for (let index = 0; index < meals.length; index++) {
+    const meal = meals[index];
+    if (!meal?.id) continue;
+    let lastError = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
       try {
+        console.log(`[nutrition/image] üretiliyor (${attempt}/3):`, meal.title);
+        const buffer = await generateMealImage(meal.title, meal.mealType);
+        if (!buffer) {
+          lastError = new Error('empty_image_buffer');
+          console.warn('[nutrition/image] boş sonuç:', meal.title);
+          continue;
+        }
         const path = `nutrition/${String(userId).replace(/[^a-zA-Z0-9_-]/g, '')}/${planId}_${index}.png`;
         const imageUrl = await uploadToCdn(path, buffer, 'image/png');
         await query(
           `UPDATE user_nutrition_meals SET image_url = ? WHERE id = ? AND plan_id = ?`,
           [imageUrl, meal.id, planId],
         );
+
+        // Program kartları meta_json.imageUrl okur — senkron tut.
+        const activityId = meal.scheduledActivityId;
+        if (activityId) {
+          const rows = await query(
+            `SELECT meta_json FROM user_scheduled_activities WHERE id = ? AND user_id = ? LIMIT 1`,
+            [activityId, userId],
+          );
+          let meta = {};
+          if (rows[0]?.meta_json) {
+            try {
+              meta = JSON.parse(rows[0].meta_json) || {};
+            } catch (_) {
+              meta = {};
+            }
+          }
+          meta.imageUrl = imageUrl;
+          await query(
+            `UPDATE user_scheduled_activities SET meta_json = ? WHERE id = ? AND user_id = ?`,
+            [JSON.stringify(meta), activityId, userId],
+          );
+        }
+        console.log('[nutrition/image] tamam:', meal.title, imageUrl);
+        meal.imageUrl = imageUrl;
+        lastError = null;
+        break;
       } catch (err) {
-        console.warn('[nutrition/cdn]', err.message);
+        lastError = err;
+        console.warn('[nutrition/cdn]', meal.title, err.message);
       }
-    }),
-  );
+    }
+    if (!meal.imageUrl) {
+      throw lastError || new Error(`nutrition_image_failed: ${meal.title}`);
+    }
+  }
 }
 
 function safeJsonParse(value, fallback) {
@@ -595,5 +642,6 @@ module.exports = {
   fetchLatestPlan,
   fetchPlanForDate,
   ensureActivityMetaColumn,
+  ensureNutritionTables,
   scheduleSingleNutritionMeal,
 };

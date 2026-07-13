@@ -97,4 +97,5 @@ module.exports = {
   cdnWeekImage,
   weekAnimalAvailable,
   uploadToCdn,
+  cdnEnabled,
 };

@@ -142,6 +142,7 @@ router.put('/answers', verifyUser, async (req, res) => {
     email: null,
     displayName,
     photoUrl: null,
+    overwriteDisplayName: Boolean(displayName),
   });
   if (req.authType === 'guest' && displayName) {
     await query(
@@ -182,7 +183,20 @@ router.put('/profile', verifyUser, async (req, res) => {
     email: req.authType === 'guest' ? guestEmail(displayName || userId) : null,
     displayName,
     photoUrl,
+    overwriteDisplayName: Boolean(displayName),
   });
+
+  // Profil ismini answers tablosunda da tut — hesap bazlı kaynak.
+  if (displayName) {
+    await query(
+      `INSERT INTO user_onboarding_answers (user_id, flow, question_key, answer_value)
+       VALUES (?, 'main', 'name', ?)
+       ON DUPLICATE KEY UPDATE
+         answer_value = VALUES(answer_value),
+         answered_at = CURRENT_TIMESTAMP`,
+      [userId, displayName],
+    );
+  }
 
   const rows = await query('SELECT * FROM users WHERE id = ? LIMIT 1', [userId]);
   res.json({ user: rows[0] });

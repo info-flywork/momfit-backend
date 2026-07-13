@@ -515,8 +515,12 @@ async function addScheduledActivity(userId, { exerciseId, scheduledAt } = {}) {
 async function fetchTodayPlan(userId, forDate = new Date(), source = 'manual') {
   await ensureActivitySourceColumn();
   try {
-    const { ensureActivityMetaColumn } = require('./nutritionService');
+    const {
+      ensureActivityMetaColumn,
+      ensureNutritionTables,
+    } = require('./nutritionService');
     await ensureActivityMetaColumn();
+    await ensureNutritionTables();
   } catch (_) {}
 
   const planSource = normalizePlanSource(source);
@@ -524,9 +528,11 @@ async function fetchTodayPlan(userId, forDate = new Date(), source = 'manual') {
 
   const rows = await query(
     `SELECT a.*, e.title_key, e.description_key, e.image_path, e.video_path, e.duration_minutes,
-            e.calories AS exercise_calories, e.intensity_percent, e.category_id
+            e.calories AS exercise_calories, e.intensity_percent, e.category_id,
+            nm.image_url AS nutrition_image_url
      FROM user_scheduled_activities a
      LEFT JOIN exercises e ON e.id = a.exercise_id
+     LEFT JOIN user_nutrition_meals nm ON nm.scheduled_activity_id = a.id
      WHERE a.user_id = ?
        AND a.scheduled_at >= ?
        AND a.scheduled_at < ?
@@ -561,7 +567,7 @@ async function fetchTodayPlan(userId, forDate = new Date(), source = 'manual') {
         calories: meta.calories ?? null,
         intensityPercent: null,
         imagePath: null,
-        imageUrl: meta.imageUrl || null,
+        imageUrl: meta.imageUrl || row.nutrition_image_url || null,
         videoUrl: null,
         categoryId: 'nutrition',
         categoryTag: meta.mealType || 'Beslenme',
@@ -604,6 +610,35 @@ async function fetchTodayPlan(userId, forDate = new Date(), source = 'manual') {
   };
 }
 
+/** Kullanıcının AI planı olan günlerini listeler (yeniden eskiye). */
+async function listAiPlans(userId, { limit = 30 } = {}) {
+  await ensureActivitySourceColumn();
+  const rows = await query(
+    `SELECT DATE(scheduled_at) AS plan_date, COUNT(*) AS activity_count
+     FROM user_scheduled_activities
+     WHERE user_id = ?
+       AND plan_source = 'ai'
+       AND (exercise_id IS NOT NULL OR activity_type = 'nutrition')
+     GROUP BY DATE(scheduled_at)
+     ORDER BY plan_date DESC
+     LIMIT ?`,
+    [userId, Math.max(1, Math.min(90, Number(limit) || 30))],
+  );
+
+  const plans = [];
+  for (const row of rows) {
+    const raw = row.plan_date;
+    const key =
+      raw instanceof Date
+        ? dateKey(raw)
+        : String(raw).slice(0, 10);
+    const plan = await fetchTodayPlan(userId, key, 'ai');
+    if (!plan || !plan.items?.length) continue;
+    plans.push({ date: key, plan });
+  }
+  return plans;
+}
+
 module.exports = {
   generateDailyPlan,
   saveDailyPlan,
@@ -611,6 +646,7 @@ module.exports = {
   saveTodayWaterLiters,
   fetchTodayPlan,
   ensureTodayPlan,
+  listAiPlans,
   toggleActivityComplete,
   addScheduledActivity,
   buildQuestionnaireFromContext,

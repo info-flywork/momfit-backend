@@ -43,7 +43,8 @@ router.post('/generate', async (req, res) => {
     res.json({ plan });
   } catch (err) {
     console.error('[nutrition/generate]', err);
-    res.status(500).json({ error: 'nutrition_generate_failed', message: err.message });
+    const status = err.status || 500;
+    res.status(status).json({ error: 'nutrition_generate_failed', message: err.message });
   }
 });
 
