@@ -2,6 +2,7 @@ const cors = require('cors');
 const express = require('express');
 const { port, openaiApiKey, openaiModel } = require('./config/env');
 const { initFirebase } = require('./middleware/firebaseAuth');
+const { requestLogger } = require('./middleware/requestLogger');
 const healthRoutes = require('./routes/health');
 const userRoutes = require('./routes/users');
 const chatRoutes = require('./routes/chats');
@@ -18,6 +19,7 @@ const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: '20mb' }));
+app.use(requestLogger);
 
 initFirebase();
 
