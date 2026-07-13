@@ -1,0 +1,24 @@
+{
+  "name": "momfit-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MomFit API — MySQL + Firebase Auth",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "db:migrate": "node src/scripts/migrate.js",
+    "migrate": "node src/scripts/migrate.js",
+    "db:seed:exercises": "node src/scripts/seed-exercises.js",
+    "db:verify:videos": "node src/scripts/verify-exercise-videos.js",
+    "db:fix:videos": "node src/scripts/fix-exercise-video-paths.js",
+    "db:test": "node src/scripts/test-connection.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "firebase-admin": "^13.4.0",
+    "mysql2": "^3.14.0"
+  }
+}

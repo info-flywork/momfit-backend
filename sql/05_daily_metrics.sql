@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS user_daily_metrics (
+  user_id VARCHAR(128) NOT NULL,
+  metric_date DATE NOT NULL,
+  water_liters DECIMAL(4,2) NOT NULL DEFAULT 0.00,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id, metric_date),
+  CONSTRAINT fk_daily_metrics_user
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
