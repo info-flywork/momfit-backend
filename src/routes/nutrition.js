@@ -16,9 +16,10 @@ router.use(ensureUserRecord);
 router.get('/plan', async (req, res) => {
   try {
     const date = typeof req.query.date === 'string' ? req.query.date : undefined;
+    const locale = typeof req.query.locale === 'string' ? req.query.locale : 'tr';
     const plan = date
-      ? await fetchPlanForDate(req.userId, date)
-      : await fetchLatestPlan(req.userId);
+      ? await fetchPlanForDate(req.userId, date, locale)
+      : await fetchLatestPlan(req.userId, locale);
     res.json({ plan });
   } catch (err) {
     console.error('[nutrition/plan/get]', err);
@@ -37,6 +38,7 @@ router.post('/generate', async (req, res) => {
       dietPreference: req.body?.dietPreference,
       sensitivities: req.body?.sensitivities || [],
       primaryGoal: req.body?.primaryGoal,
+      locale: req.body?.locale,
     };
     const date = typeof req.body?.date === 'string' ? req.body.date : undefined;
     const plan = await generateAndSavePlan(req.userId, questionnaire, date);

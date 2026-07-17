@@ -4,6 +4,42 @@ const { openaiApiKey, openaiModel } = require('../config/env');
 
 let tablesReady = false;
 let metaColumnReady = false;
+let translationsColumnReady = false;
+
+const NUTRITION_LANGUAGES = {
+  tr: 'Turkish',
+  en: 'English',
+  de: 'German',
+  it: 'Italian',
+  fr: 'French',
+  ja: 'Japanese',
+  es: 'Spanish',
+  ru: 'Russian',
+  ko: 'Korean',
+  hi: 'Hindi',
+  pt: 'Portuguese',
+  zh: 'Chinese',
+};
+
+const BEGINNER_LEVELS = {
+  tr: 'Başlangıç',
+  en: 'Beginner',
+  de: 'Anfänger',
+  it: 'Principiante',
+  fr: 'Débutant',
+  ja: '初心者',
+  es: 'Principiante',
+  ru: 'Начальный',
+  ko: '초급',
+  hi: 'शुरुआती',
+  pt: 'Iniciante',
+  zh: '初级',
+};
+
+function normalizeNutritionLocale(locale) {
+  const code = String(locale || 'tr').trim().toLowerCase().split(/[-_]/)[0];
+  return NUTRITION_LANGUAGES[code] ? code : 'tr';
+}
 
 async function ensureNutritionTables() {
   if (tablesReady) return;
@@ -48,6 +84,7 @@ async function ensureNutritionTables() {
   `);
   tablesReady = true;
   await ensureMealNutrientsColumn();
+  await ensureMealTranslationsColumn();
 }
 
 let nutrientsColumnReady = false;
@@ -66,6 +103,22 @@ async function ensureMealNutrientsColumn() {
     }
   }
   nutrientsColumnReady = true;
+}
+
+async function ensureMealTranslationsColumn() {
+  if (translationsColumnReady) return;
+  try {
+    await query(
+      `ALTER TABLE user_nutrition_meals
+       ADD COLUMN translations_json LONGTEXT NULL AFTER nutrients_json`,
+    );
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (err?.code !== 'ER_DUP_FIELDNAME' && !msg.toLowerCase().includes('duplicate')) {
+      console.warn('[nutrition] translations_json alter:', msg);
+    }
+  }
+  translationsColumnReady = true;
 }
 
 async function ensureActivityMetaColumn() {
@@ -174,8 +227,11 @@ function normalizeNutrients(raw, macros = {}) {
 }
 
 async function callOpenAiNutritionPlan(questionnaire) {
+  const locale = normalizeNutritionLocale(questionnaire?.locale);
+  const language = NUTRITION_LANGUAGES[locale];
   const prompt = `Hamilelik için günlük beslenme planı oluştur. Sadece JSON dön.
 Kullanıcı: ${JSON.stringify(questionnaire)}
+Yanıt dili: ${language}.
 Format:
 {
   "dailyCalories": 1800,
@@ -194,7 +250,8 @@ Format:
     }
   ]
 }
-3-4 öğün öner. Güvenli, pratik, hamileliğe uygun olsun. Türkçe yaz.
+3-4 öğün öner. Güvenli, pratik, hamileliğe uygun olsun.
+title, mealType, ingredients ve instructions alanlarını yalnızca ${language} dilinde yaz.
 nutrients alanları o öğünün günlük ihtiyacı karşılama yüzdesi olsun (0-100).`;
 
   const response = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -346,9 +403,11 @@ async function generateAndSavePlan(userId, questionnaire = {}, forDate = new Dat
   await ensureMealNutrientsColumn();
 
   let raw;
+  let sourceLocale = 'tr';
   if (openaiApiKey) {
     try {
       raw = await callOpenAiNutritionPlan(questionnaire);
+      sourceLocale = normalizeNutritionLocale(questionnaire?.locale);
     } catch (err) {
       console.error('[nutrition/generate]', err.message);
       raw = fallbackPlan(questionnaire);
@@ -392,12 +451,21 @@ async function generateAndSavePlan(userId, questionnaire = {}, forDate = new Dat
   for (let i = 0; i < plan.meals.length; i++) {
     const meal = plan.meals[i];
     const mealId = newId('nmeal');
+    const translations = {
+      [sourceLocale]: {
+        title: meal.title,
+        mealType: meal.mealType,
+        ingredients: meal.ingredients || [],
+        instructions: meal.instructions || [],
+        level: BEGINNER_LEVELS[sourceLocale],
+      },
+    };
     await query(
       `INSERT INTO user_nutrition_meals
         (id, plan_id, title, meal_type, calories, protein_g, fat_g, carbs_g,
-         image_url, ingredients_json, instructions_json, nutrients_json,
+         image_url, ingredients_json, instructions_json, nutrients_json, translations_json,
          cooking_minutes, sort_order, scheduled_activity_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         mealId,
         planId,
@@ -411,6 +479,7 @@ async function generateAndSavePlan(userId, questionnaire = {}, forDate = new Dat
         JSON.stringify(meal.ingredients || []),
         JSON.stringify(meal.instructions || []),
         JSON.stringify(meal.nutrients || {}),
+        JSON.stringify(translations),
         meal.cookingMinutes,
         i,
         meal.scheduledActivityId || null,
@@ -438,6 +507,7 @@ async function generateAndSavePlan(userId, questionnaire = {}, forDate = new Dat
     throw err;
   }
 
+  const localizedMeals = await translateMeals(mealRows, questionnaire?.locale);
   return formatPlanResponse(
     {
       id: planId,
@@ -448,7 +518,8 @@ async function generateAndSavePlan(userId, questionnaire = {}, forDate = new Dat
       fat_g: plan.dailyMacros.fat,
       carbs_g: plan.dailyMacros.carbs,
     },
-    mealRows,
+    localizedMeals,
+    questionnaire?.locale,
   );
 }
 
@@ -520,7 +591,111 @@ function safeJsonParse(value, fallback) {
   }
 }
 
-function formatPlanResponse(planRow, mealRows) {
+async function translateMeals(mealRows, locale) {
+  const lang = normalizeNutritionLocale(locale);
+  const rows = (mealRows || []).map((row) => ({ ...row }));
+  const missing = [];
+
+  for (const row of rows) {
+    const translations = safeJsonParse(row.translations_json, {});
+    if (translations[lang]) {
+      row._translation = translations[lang];
+    } else {
+      missing.push(row);
+    }
+  }
+
+  if (missing.length > 0 && openaiApiKey) {
+    try {
+      const sourceMeals = missing.map((row) => ({
+        id: row.id,
+        title: row.title,
+        mealType: row.meal_type,
+        ingredients: safeJsonParse(row.ingredients_json, []),
+        instructions: safeJsonParse(row.instructions_json, []),
+      }));
+      const language = NUTRITION_LANGUAGES[lang];
+      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${openaiApiKey}`,
+        },
+        body: JSON.stringify({
+          model: openaiModel,
+          temperature: 0.2,
+          response_format: { type: 'json_object' },
+          messages: [
+            {
+              role: 'system',
+              content:
+                `Translate nutrition recipe text to ${language}. ` +
+                'Preserve meal IDs, quantities, units and array structure. Return only valid JSON.',
+            },
+            {
+              role: 'user',
+              content: JSON.stringify({
+                format: {
+                  meals: [{
+                    id: 'same id',
+                    title: 'translated',
+                    mealType: 'translated',
+                    ingredients: ['translated'],
+                    instructions: ['translated'],
+                  }],
+                },
+                meals: sourceMeals,
+              }),
+            },
+          ],
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(`translation_failed: ${response.status}`);
+      }
+      const data = await response.json();
+      const translated = JSON.parse(data.choices?.[0]?.message?.content || '{}');
+      const byId = new Map(
+        (Array.isArray(translated.meals) ? translated.meals : [])
+          .filter((item) => item && item.id)
+          .map((item) => [String(item.id), item]),
+      );
+
+      for (const row of missing) {
+        const item = byId.get(String(row.id));
+        if (!item) continue;
+        const localized = {
+          title: String(item.title || row.title),
+          mealType: String(item.mealType || row.meal_type),
+          ingredients: Array.isArray(item.ingredients)
+            ? item.ingredients.map(String)
+            : safeJsonParse(row.ingredients_json, []),
+          instructions: Array.isArray(item.instructions)
+            ? item.instructions.map(String)
+            : safeJsonParse(row.instructions_json, []),
+          level: BEGINNER_LEVELS[lang],
+        };
+        const translations = safeJsonParse(row.translations_json, {});
+        translations[lang] = localized;
+        row.translations_json = JSON.stringify(translations);
+        row._translation = localized;
+        await query(
+          `UPDATE user_nutrition_meals
+           SET translations_json = ?
+           WHERE id = ?`,
+          [row.translations_json, row.id],
+        );
+      }
+    } catch (err) {
+      console.warn('[nutrition/translation]', lang, err.message);
+    }
+  }
+
+  return rows;
+}
+
+function formatPlanResponse(planRow, mealRows, locale = 'tr') {
+  const lang = normalizeNutritionLocale(locale);
   return {
     id: planRow.id,
     planDate: dateKey(planRow.plan_date),
@@ -533,6 +708,7 @@ function formatPlanResponse(planRow, mealRows) {
     },
     isGenerated: true,
     meals: (mealRows || []).map((m) => {
+      const translated = m._translation || {};
       const macros = {
         protein: Number(m.protein_g) || 0,
         fat: Number(m.fat_g) || 0,
@@ -540,22 +716,26 @@ function formatPlanResponse(planRow, mealRows) {
       };
       return {
         id: m.id,
-        title: m.title,
-        mealType: m.meal_type,
+        title: translated.title || m.title,
+        mealType: translated.mealType || m.meal_type,
         calories: Number(m.calories) || 0,
         macros,
         nutrients: normalizeNutrients(safeJsonParse(m.nutrients_json, {}), macros),
         imageUrl: m.image_url || null,
-        ingredients: safeJsonParse(m.ingredients_json, []),
-        instructions: safeJsonParse(m.instructions_json, []),
+        ingredients: Array.isArray(translated.ingredients)
+          ? translated.ingredients
+          : safeJsonParse(m.ingredients_json, []),
+        instructions: Array.isArray(translated.instructions)
+          ? translated.instructions
+          : safeJsonParse(m.instructions_json, []),
         cookingMinutes: Number(m.cooking_minutes) || 20,
-        level: 'Başlangıç',
+        level: translated.level || BEGINNER_LEVELS[lang],
       };
     }),
   };
 }
 
-async function fetchLatestPlan(userId) {
+async function fetchLatestPlan(userId, locale = 'tr') {
   await ensureNutritionTables();
   const plans = await query(
     `SELECT * FROM user_nutrition_plans
@@ -571,10 +751,11 @@ async function fetchLatestPlan(userId) {
      ORDER BY sort_order ASC`,
     [plans[0].id],
   );
-  return formatPlanResponse(plans[0], meals);
+  const localizedMeals = await translateMeals(meals, locale);
+  return formatPlanResponse(plans[0], localizedMeals, locale);
 }
 
-async function fetchPlanForDate(userId, forDate = new Date()) {
+async function fetchPlanForDate(userId, forDate = new Date(), locale = 'tr') {
   await ensureNutritionTables();
   const key = dateKey(forDate);
   const plans = await query(
@@ -590,7 +771,8 @@ async function fetchPlanForDate(userId, forDate = new Date()) {
      ORDER BY sort_order ASC`,
     [plans[0].id],
   );
-  return formatPlanResponse(plans[0], meals);
+  const localizedMeals = await translateMeals(meals, locale);
+  return formatPlanResponse(plans[0], localizedMeals, locale);
 }
 
 async function scheduleSingleNutritionMeal(userId, payload = {}) {
